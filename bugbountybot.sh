@@ -116,7 +116,7 @@ resolve_scan_type() {
             echo "full"
             ;;
         *)
-            warn "Unknown scan mode '$mode', defaulting to full"
+            warn "Unknown scan mode '$mode', defaulting to full" >&2
             echo "full"
             ;;
     esac
@@ -211,6 +211,7 @@ EOF
 
 run_smoke_tests() {
     local failures=0
+    local smoke_status=0
 
     if ! command -v sqlite3 &>/dev/null; then
         warn "sqlite3 not found; skipping smoke tests"
@@ -275,10 +276,44 @@ run_smoke_tests() {
 
     if [ "$failures" -gt 0 ]; then
         error "Smoke tests failed: $failures"
+        smoke_status=1
+    else
+        success "Smoke tests passed"
+    fi
+
+    return "$smoke_status"
+}
+
+run_unit_tests() {
+    local failures=0
+
+    local parsed
+    parsed="$(resolve_scan_type "passive")"
+    [ "$parsed" = "recon" ] || failures=$((failures + 1))
+
+    parsed="$(resolve_scan_type "active")"
+    [ "$parsed" = "vuln" ] || failures=$((failures + 1))
+
+    parsed="$(resolve_scan_type "hybrid")"
+    [ "$parsed" = "full" ] || failures=$((failures + 1))
+
+    local escaped
+    escaped="$(sql_escape "a'b")"
+    [ "$escaped" = "a''b" ] || failures=$((failures + 1))
+
+    local clause
+    clause="$(build_program_filter_clause "all")"
+    [ -z "$clause" ] || failures=$((failures + 1))
+
+    clause="$(build_program_filter_clause "acme")"
+    [ "$clause" = " AND program_handle='acme'" ] || failures=$((failures + 1))
+
+    if [ "$failures" -gt 0 ]; then
+        error "Unit tests failed: $failures"
         return 1
     fi
 
-    success "Smoke tests passed"
+    success "Unit tests passed"
     return 0
 }
 
@@ -318,7 +353,7 @@ fetch_h1_programs() {
     fi
     
     local programs_json
-    programs_json=$(h1_api_request "/programs" "GET")
+    programs_json=$(h1_api_request "/programs" "GET" || true)
     
     if [ -z "$programs_json" ] || [ "$programs_json" = "null" ]; then
         warn "Could not fetch programs via API, using public data..."
@@ -332,21 +367,30 @@ fetch_h1_programs() {
 fetch_programs_public() {
     log "Fetching programs from public sources..."
 
-    curl -s "https://hackerone.com/directory?sort=published" 2>/dev/null | \
-        grep -oP '"handle":"[^"]+"' 2>/dev/null | \
-        sed -E 's/"handle":"([^"]+)"/\1/' | \
-        sort -u | \
-        while IFS= read -r handle; do
-            [ -n "$handle" ] || continue
-            printf "%s\t%s\t%s\t%s\n" "$handle" "" "https://hackerone.com/$handle" ""
-        done
+    local handles
+    handles=$(
+        curl -s "https://hackerone.com/directory?sort=published" 2>/dev/null | \
+            grep -oP '"handle":"[^"]+"' 2>/dev/null | \
+            sed -E 's/"handle":"([^"]+)"/\1/' | \
+            sort -u || true
+    )
+
+    while IFS= read -r handle; do
+        [ -n "$handle" ] || continue
+        printf "%s\t%s\t%s\t%s\n" "$handle" "" "https://hackerone.com/$handle" ""
+    done <<< "$handles"
 }
 
 get_program_scope() {
     local handle="$1"
+
+    if ! command -v jq &>/dev/null; then
+        fetch_scope_public "$handle"
+        return
+    fi
     
     local scope_json
-    scope_json=$(h1_api_request "/programs/$handle/scopes" "GET")
+    scope_json=$(h1_api_request "/programs/$handle/scopes" "GET" || true)
     
     if [ -z "$scope_json" ] || [ "$scope_json" = "null" ]; then
         log "Fetching scope for $handle from public data..."
@@ -380,8 +424,8 @@ add_program() {
 
     local min_bounty=0 max_bounty=0
     if [ -n "$bounty" ] && [ "$bounty" != "null" ]; then
-        min_bounty=$(echo "$bounty" | grep -oP '\$[0-9]+' | head -1 | sed 's/\$//' | sed 's/,//')
-        max_bounty=$(echo "$bounty" | grep -oP '\$[0-9]+' | tail -1 | sed 's/\$//' | sed 's/,//')
+        min_bounty=$(echo "$bounty" | grep -oP '\$[0-9]+' | head -1 | sed 's/\$//' | sed 's/,//' || true)
+        max_bounty=$(echo "$bounty" | grep -oP '\$[0-9]+' | tail -1 | sed 's/\$//' | sed 's/,//' || true)
 
         if ! [[ "$min_bounty" =~ ^[0-9]+$ ]]; then
             min_bounty=0
@@ -612,7 +656,7 @@ parse_results() {
             [ -n "$line" ] || continue
 
             local severity
-            severity=$(echo "$line" | grep -oE '\[(critical|high|medium|low|info)\]' | head -1 | tr -d '[]')
+            severity=$(echo "$line" | grep -oE '\[(critical|high|medium|low|info)\]' | head -1 | tr -d '[]' || true)
 
             local vuln_name
             vuln_name=$(echo "$line" | sed -n 's/^\[[^]]*\]\[[^]]*\]\s*\([^ ]*\).*/\1/p')
@@ -961,12 +1005,13 @@ show_help() {
     echo "  clear [program]     Clear findings"
     echo "  status              Show status"
     echo "  continuous          Run continuous scanning"
-    echo "  test                Run internal smoke tests"
+    echo "  test                Run internal tests"
     echo "  help                Show this help"
     echo ""
     echo "OPTIONS:"
     echo "  --mode passive|active|hybrid  Scan mode"
     echo "  --interval SECONDS            Scan interval"
+    echo "  --test                        Run tests before command"
     echo ""
     echo "EXAMPLES:"
     echo "  bugbountybot sync"
@@ -985,10 +1030,14 @@ main() {
 
     local mode_override=""
     local interval_override=""
+    local run_tests=false
     local positional=()
 
     while [ "$#" -gt 0 ]; do
         case "$1" in
+            --test)
+                run_tests=true
+                ;;
             --mode)
                 shift || true
                 if [ "$#" -eq 0 ]; then
@@ -1030,6 +1079,11 @@ main() {
     fi
 
     MODE="$(resolve_scan_type "$MODE")"
+
+    if [ "$run_tests" = true ]; then
+        run_unit_tests || exit 1
+        run_smoke_tests || exit 1
+    fi
     
     case "$command" in
         sync)
@@ -1066,7 +1120,7 @@ main() {
             run_continuous_scan
             ;;
         test)
-            run_smoke_tests
+            run_unit_tests && run_smoke_tests
             ;;
         help|--help|-h)
             show_help
