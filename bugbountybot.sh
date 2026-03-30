@@ -92,14 +92,62 @@ EOF
     fi
 }
 
+sql_escape() {
+    local value="${1:-}"
+    value="${value//\'/\'\'}"
+    printf "%s" "$value"
+}
+
+is_positive_int() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]] && [ "$1" -gt 0 ]
+}
+
+resolve_scan_type() {
+    local mode="${1:-full}"
+
+    case "$mode" in
+        passive|recon)
+            echo "recon"
+            ;;
+        active|vuln)
+            echo "vuln"
+            ;;
+        hybrid|full)
+            echo "full"
+            ;;
+        *)
+            warn "Unknown scan mode '$mode', defaulting to full"
+            echo "full"
+            ;;
+    esac
+}
+
+build_program_filter_clause() {
+    local program="${1:-all}"
+
+    if [ -n "$program" ] && [ "$program" != "all" ]; then
+        printf " AND program_handle='%s'" "$(sql_escape "$program")"
+    fi
+}
+
 load_config() {
+    init_config
+
     if command -v yq &>/dev/null; then
         eval "$(yq eval -o=shell "$CONFIG_FILE" 2>/dev/null || echo 'true')"
     fi
     
-    MAX_CONCURRENT=${scan_max_concurrent_scans:-3}
+    MAX_CONCURRENT=${general_max_concurrent_scans:-3}
     SCAN_INTERVAL=${general_scan_interval:-3600}
     MODE="${general_mode:-passive}"
+
+    if ! is_positive_int "$MAX_CONCURRENT"; then
+        MAX_CONCURRENT=3
+    fi
+
+    if ! is_positive_int "$SCAN_INTERVAL"; then
+        SCAN_INTERVAL=3600
+    fi
 }
 
 load_db() {
@@ -118,7 +166,8 @@ CREATE TABLE programs (
     last_scanned TIMESTAMP,
     status TEXT,
     resolved_count INTEGER,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE targets (
@@ -154,6 +203,83 @@ CREATE INDEX idx_findings_severity ON findings(severity);
 EOF
         success "Initialized database: $DATABASE"
     fi
+
+    if ! sqlite3 "$DATABASE" "PRAGMA table_info(programs);" 2>/dev/null | grep -q '|updated_at|'; then
+        sqlite3 "$DATABASE" "ALTER TABLE programs ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;" 2>/dev/null || true
+    fi
+}
+
+run_smoke_tests() {
+    local failures=0
+
+    if ! command -v sqlite3 &>/dev/null; then
+        warn "sqlite3 not found; skipping smoke tests"
+        return 0
+    fi
+
+    local test_dir
+    test_dir=$(mktemp -d)
+    local test_db="$test_dir/programs.db"
+    local test_reports_dir="$test_dir/reports"
+    mkdir -p "$test_reports_dir"
+
+    local original_database="$DATABASE"
+    local original_reports_dir="$REPORTS_DIR"
+    DATABASE="$test_db"
+    REPORTS_DIR="$test_reports_dir"
+
+    if ! load_db >/dev/null 2>&1; then
+        error "Smoke test failed: unable to initialize database"
+        failures=$((failures + 1))
+    fi
+
+    if ! add_program "acme'corp" "ACME's Program" "https://example.com" "\$100-\$500" >/dev/null 2>&1; then
+        error "Smoke test failed: add_program with quotes"
+        failures=$((failures + 1))
+    fi
+
+    if ! add_target "acme'corp" "domain" "api.example.com" >/dev/null 2>&1; then
+        error "Smoke test failed: add_target"
+        failures=$((failures + 1))
+    fi
+
+    if ! add_finding "acme'corp" "api.example.com" "test vuln" "high" "example evidence" >/dev/null 2>&1; then
+        error "Smoke test failed: add_finding"
+        failures=$((failures + 1))
+    fi
+
+    local targets_count
+    targets_count=$(get_targets_for_program "acme'corp" | wc -l | tr -d ' ')
+    if [ "${targets_count:-0}" -lt 1 ]; then
+        error "Smoke test failed: query targets"
+        failures=$((failures + 1))
+    fi
+
+    generate_report "acme'corp" "json" >/dev/null 2>&1 || true
+    local report_exists=0
+    for report_candidate in "$REPORTS_DIR"/report_*.json; do
+        if [ -f "$report_candidate" ]; then
+            report_exists=1
+            break
+        fi
+    done
+
+    if [ "$report_exists" -ne 1 ]; then
+        error "Smoke test failed: generate_report"
+        failures=$((failures + 1))
+    fi
+
+    DATABASE="$original_database"
+    REPORTS_DIR="$original_reports_dir"
+    rm -rf "$test_dir"
+
+    if [ "$failures" -gt 0 ]; then
+        error "Smoke tests failed: $failures"
+        return 1
+    fi
+
+    success "Smoke tests passed"
+    return 0
 }
 
 h1_api_request() {
@@ -168,15 +294,28 @@ h1_api_request() {
     
     local auth=$(echo -n "${api_hackerone_username}:${api_hackerone_api_key}" | base64)
     
-    curl -s -X "$method" \
-        -H "Authorization: Basic $auth" \
-        -H "Content-Type: application/json" \
-        "https://api.hackerone.com/v1$endpoint" \
-        $data
+    if [ -n "$data" ]; then
+        curl -s -X "$method" \
+            -H "Authorization: Basic $auth" \
+            -H "Content-Type: application/json" \
+            --data "$data" \
+            "https://api.hackerone.com/v1$endpoint"
+    else
+        curl -s -X "$method" \
+            -H "Authorization: Basic $auth" \
+            -H "Content-Type: application/json" \
+            "https://api.hackerone.com/v1$endpoint"
+    fi
 }
 
 fetch_h1_programs() {
     log "Fetching HackerOne bug bounty programs..."
+
+    if ! command -v jq &>/dev/null; then
+        warn "jq not installed, using public program feed"
+        fetch_programs_public
+        return
+    fi
     
     local programs_json
     programs_json=$(h1_api_request "/programs" "GET")
@@ -187,20 +326,20 @@ fetch_h1_programs() {
         return
     fi
     
-    echo "$programs_json" | jq -r '.data[] | {handle: .attributes.handle, name: .attributes.name, url: .attributes.url, bounty: .attributes.reward_range}' 2>/dev/null
+    echo "$programs_json" | jq -r '.data[] | [(.attributes.handle // ""), (.attributes.name // ""), (.attributes.url // ""), (.attributes.reward_range // "")] | @tsv' 2>/dev/null
 }
 
 fetch_programs_public() {
     log "Fetching programs from public sources..."
-    
-    local temp_programs=$(mktemp)
-    
+
     curl -s "https://hackerone.com/directory?sort=published" 2>/dev/null | \
-        grep -oP '"handle":"[^"]+"|"name":"[^"]+"|"reward_range":"[^"]+"|"state":"[^"]+"' 2>/dev/null | \
-        sed 's/"//g' | sed 's/:/:/' > "$temp_programs"
-    
-    cat "$temp_programs"
-    rm -f "$temp_programs"
+        grep -oP '"handle":"[^"]+"' 2>/dev/null | \
+        sed -E 's/"handle":"([^"]+)"/\1/' | \
+        sort -u | \
+        while IFS= read -r handle; do
+            [ -n "$handle" ] || continue
+            printf "%s\t%s\t%s\t%s\n" "$handle" "" "https://hackerone.com/$handle" ""
+        done
 }
 
 get_program_scope() {
@@ -233,19 +372,33 @@ add_program() {
     local url="$3"
     local bounty="$4"
     
+    local safe_handle safe_name safe_url safe_bounty
+    safe_handle="$(sql_escape "$handle")"
+    safe_name="$(sql_escape "${name:-$handle}")"
+    safe_url="$(sql_escape "$url")"
+    safe_bounty="$(sql_escape "$bounty")"
+
     local min_bounty=0 max_bounty=0
     if [ -n "$bounty" ] && [ "$bounty" != "null" ]; then
         min_bounty=$(echo "$bounty" | grep -oP '\$[0-9]+' | head -1 | sed 's/\$//' | sed 's/,//')
         max_bounty=$(echo "$bounty" | grep -oP '\$[0-9]+' | tail -1 | sed 's/\$//' | sed 's/,//')
+
+        if ! [[ "$min_bounty" =~ ^[0-9]+$ ]]; then
+            min_bounty=0
+        fi
+
+        if ! [[ "$max_bounty" =~ ^[0-9]+$ ]]; then
+            max_bounty=$min_bounty
+        fi
     fi
     
     sqlite3 "$DATABASE" << EOF
 INSERT OR REPLACE INTO programs (handle, name, url, reward_range, min_bounty, max_bounty, status, updated_at)
-VALUES ('$handle', '${name:-"$handle"}', '$url', '$bounty', $min_bounty, $max_bounty, 'active', datetime('now'))
+VALUES ('$safe_handle', '$safe_name', '$safe_url', '$safe_bounty', $min_bounty, $max_bounty, 'active', datetime('now'))
 ON CONFLICT(handle) DO UPDATE SET
-    name='${name:-"$handle"}',
-    url='$url',
-    reward_range='$bounty',
+    name='$safe_name',
+    url='$safe_url',
+    reward_range='$safe_bounty',
     min_bounty=$min_bounty,
     max_bounty=$max_bounty,
     updated_at=datetime('now');
@@ -256,10 +409,15 @@ add_target() {
     local program="$1"
     local type="$2"
     local value="$3"
+
+    local safe_program safe_type safe_value
+    safe_program="$(sql_escape "$program")"
+    safe_type="$(sql_escape "$type")"
+    safe_value="$(sql_escape "$value")"
     
     sqlite3 "$DATABASE" << EOF
 INSERT OR IGNORE INTO targets (program_handle, type, value, status, last_found)
-VALUES ('$program', '$type', '$value', 'active', datetime('now'));
+VALUES ('$safe_program', '$safe_type', '$safe_value', 'active', datetime('now'));
 EOF
 }
 
@@ -269,14 +427,21 @@ get_active_targets() {
 
 get_targets_for_program() {
     local program="$1"
-    sqlite3 "$DATABASE" "SELECT type, value FROM targets WHERE program_handle='$program' AND status='active';" 2>/dev/null
+    local safe_program
+    safe_program="$(sql_escape "$program")"
+
+    sqlite3 "$DATABASE" "SELECT type, value FROM targets WHERE program_handle='$safe_program' AND status='active';" 2>/dev/null
 }
 
 update_target_scan() {
     local program="$1"
     local value="$2"
+
+    local safe_program safe_value
+    safe_program="$(sql_escape "$program")"
+    safe_value="$(sql_escape "$value")"
     
-    sqlite3 "$DATABASE" "UPDATE targets SET last_scanned=datetime('now') WHERE program_handle='$program' AND value='$value';" 2>/dev/null
+    sqlite3 "$DATABASE" "UPDATE targets SET last_scanned=datetime('now') WHERE program_handle='$safe_program' AND value='$safe_value';" 2>/dev/null
 }
 
 add_finding() {
@@ -286,9 +451,16 @@ add_finding() {
     local severity="$4"
     local evidence="$5"
     
+    local safe_program safe_target safe_vuln safe_severity safe_evidence
+    safe_program="$(sql_escape "$program")"
+    safe_target="$(sql_escape "$target")"
+    safe_vuln="$(sql_escape "$vuln")"
+    safe_severity="$(sql_escape "$severity")"
+    safe_evidence="$(sql_escape "$evidence")"
+
     sqlite3 "$DATABASE" << EOF
 INSERT INTO findings (program_handle, target, vulnerability, severity, status, evidence, reported_at)
-VALUES ('$program', '$target', '$vuln', '$severity', 'new', '$evidence', datetime('now'));
+VALUES ('$safe_program', '$safe_target', '$safe_vuln', '$safe_severity', 'new', '$safe_evidence', datetime('now'));
 EOF
     
     local id=$(sqlite3 "$DATABASE" "SELECT last_insert_rowid();")
@@ -297,7 +469,10 @@ EOF
 
 get_resolved_count() {
     local program="$1"
-    sqlite3 "$DATABASE" "SELECT COUNT(*) FROM programs WHERE handle='$program' AND status='resolved';" 2>/dev/null
+    local safe_program
+    safe_program="$(sql_escape "$program")"
+
+    sqlite3 "$DATABASE" "SELECT COUNT(*) FROM programs WHERE handle='$safe_program' AND status='resolved';" 2>/dev/null
 }
 
 sync_all_programs() {
@@ -306,14 +481,13 @@ sync_all_programs() {
     local temp_file=$(mktemp)
     fetch_h1_programs > "$temp_file" 2>/dev/null
     
-    while IFS= read -r line; do
-        if [[ "$line" =~ handle:(.*) ]]; then
-            local handle="${BASH_REMATCH[1]}"
-            add_program "$handle" "" "" ""
-            get_program_scope "$handle" | while read -r scope; do
-                add_target "$handle" "domain" "$scope"
-            done
-        fi
+    while IFS=$'\t' read -r handle name url bounty; do
+        [ -n "$handle" ] || continue
+        add_program "$handle" "$name" "$url" "$bounty"
+        while IFS= read -r scope; do
+            [ -n "$scope" ] || continue
+            add_target "$handle" "domain" "$scope"
+        done < <(get_program_scope "$handle")
     done < "$temp_file"
     
     rm -f "$temp_file"
@@ -431,16 +605,23 @@ parse_results() {
     local target="$2"
     local output_dir="$3"
     
-    if [ -f "$output_dir/nuclei.txt" ]; then
+    local nuclei_file="$output_dir/$(echo "$target" | tr '/.' '_')/nuclei.txt"
+
+    if [ -f "$nuclei_file" ]; then
         while IFS= read -r line; do
-            if [ -n "$line" ]; then
-                local severity=$(echo "$line" | grep -oE '\[(critical|high|medium|low|info)\]' | sed 's/\[//;s/\]//')
-                local vuln_name=$(echo "$line" | grep -oE '\[.*\]' | tail -n +2 | head -1 | sed 's/\[//;s/\]//')
-                if [ -n "$severity" ]; then
-                    add_finding "$program" "$target" "$vuln_name" "$severity" "$line"
-                fi
+            [ -n "$line" ] || continue
+
+            local severity
+            severity=$(echo "$line" | grep -oE '\[(critical|high|medium|low|info)\]' | head -1 | tr -d '[]')
+
+            local vuln_name
+            vuln_name=$(echo "$line" | sed -n 's/^\[[^]]*\]\[[^]]*\]\s*\([^ ]*\).*/\1/p')
+            [ -n "$vuln_name" ] || vuln_name="nuclei-finding"
+
+            if [ -n "$severity" ]; then
+                add_finding "$program" "$target" "$vuln_name" "$severity" "$line" >/dev/null
             fi
-        done < "$output_dir/nuclei.txt"
+        done < "$nuclei_file"
     fi
 }
 
@@ -457,6 +638,9 @@ scan_program() {
         return 1
     fi
     
+    local normalized_scan_type
+    normalized_scan_type="$(resolve_scan_type "$scan_type")"
+
     local count=0
     while IFS= read -r line; do
         if [ -n "$line" ]; then
@@ -468,7 +652,7 @@ scan_program() {
                 count=0
             fi
             
-            process_target "$program" "$type" "$target" "$scan_type" &
+            process_target "$program" "$type" "$target" "$normalized_scan_type" &
             count=$((count + 1))
         fi
     done <<< "$targets"
@@ -487,16 +671,41 @@ run_continuous_scan() {
         local programs=$(sqlite3 "$DATABASE" "SELECT handle FROM programs WHERE status='active';" 2>/dev/null)
         
         for program in $programs; do
-            local resolved=$(sqlite3 "$DATABASE" "SELECT resolved_count FROM programs WHERE handle='$program';" 2>/dev/null || echo 0)
+            local safe_program
+            safe_program="$(sql_escape "$program")"
+            local resolved=$(sqlite3 "$DATABASE" "SELECT COALESCE(resolved_count,0) FROM programs WHERE handle='$safe_program';" 2>/dev/null || echo 0)
             local min_bounty=${filters_min_bounty:-0}
             local max_reports=${filters_max_reports_resolved:-1000}
+
+            if ! [[ "$resolved" =~ ^[0-9]+$ ]]; then
+                resolved=0
+            fi
+
+            if ! [[ "$max_reports" =~ ^[0-9]+$ ]]; then
+                max_reports=1000
+            fi
             
             if [ "$resolved" -gt "$max_reports" ]; then
                 warn "Skipping $program - too many resolved reports"
                 continue
             fi
+
+            if [[ "$min_bounty" =~ ^[0-9]+$ ]]; then
+                local safe_program_for_bounty
+                safe_program_for_bounty="$(sql_escape "$program")"
+                local program_max_bounty
+                program_max_bounty=$(sqlite3 "$DATABASE" "SELECT COALESCE(max_bounty,0) FROM programs WHERE handle='$safe_program_for_bounty';" 2>/dev/null || echo 0)
+                if ! [[ "$program_max_bounty" =~ ^[0-9]+$ ]]; then
+                    program_max_bounty=0
+                fi
+
+                if [ "$program_max_bounty" -lt "$min_bounty" ]; then
+                    warn "Skipping $program - bounty below minimum filter"
+                    continue
+                fi
+            fi
             
-            scan_program "$program" "$MODE"
+            scan_program "$program" "$(resolve_scan_type "$MODE")"
         done
         
         log "=== Scan cycle completed ==="
@@ -528,7 +737,7 @@ scan_single_target() {
         return 1
     fi
     
-    process_target "$program" "domain" "$target" "$scan_type"
+    process_target "$program" "domain" "$target" "$(resolve_scan_type "$scan_type")"
 }
 
 list_programs() {
@@ -553,7 +762,9 @@ list_targets() {
     echo ""
     
     if [ -n "$program" ]; then
-        sqlite3 -header -column "$DATABASE" "SELECT program_handle, type, value, last_scanned, vuln_count FROM targets WHERE program_handle='$program' ORDER BY last_found DESC LIMIT 50;" 2>/dev/null
+        local safe_program
+        safe_program="$(sql_escape "$program")"
+        sqlite3 -header -column "$DATABASE" "SELECT program_handle, type, value, last_scanned, vuln_count FROM targets WHERE program_handle='$safe_program' ORDER BY last_found DESC LIMIT 50;" 2>/dev/null
     else
         sqlite3 -header -column "$DATABASE" "SELECT program_handle, type, value, last_scanned, vuln_count FROM targets ORDER BY last_found DESC LIMIT 50;" 2>/dev/null
     fi
@@ -573,11 +784,11 @@ list_findings() {
     local query="SELECT program_handle, target, vulnerability, severity, reported_at FROM findings WHERE status='new'"
     
     if [ -n "$program" ]; then
-        query="$query AND program_handle='$program'"
+        query="$query AND program_handle='$(sql_escape "$program")'"
     fi
     
     if [ -n "$severity" ]; then
-        query="$query AND severity='$severity'"
+        query="$query AND severity='$(sql_escape "$severity")'"
     fi
     
     query="$query ORDER BY severity DESC, reported_at DESC LIMIT 100;"
@@ -590,12 +801,14 @@ generate_report() {
     local format="${2:-html}"
     
     local output_file="$REPORTS_DIR/report_$(date +%Y%m%d_%H%M%S).$format"
+    local where_program
+    where_program="$(build_program_filter_clause "$program")"
     
     log "Generating $format report for $program..."
     
-    local critical=$(sqlite3 "$DATABASE" "SELECT COUNT(*) FROM findings WHERE status='new' AND severity='critical';" 2>/dev/null || echo 0)
-    local high=$(sqlite3 "$DATABASE" "SELECT COUNT(*) FROM findings WHERE status='new' AND severity='high';" 2>/dev/null || echo 0)
-    local medium=$(sqlite3 "$DATABASE" "SELECT COUNT(*) FROM findings WHERE status='new' AND severity='medium';" 2>/dev/null || echo 0)
+    local critical=$(sqlite3 "$DATABASE" "SELECT COUNT(*) FROM findings WHERE status='new' AND severity='critical'$where_program;" 2>/dev/null || echo 0)
+    local high=$(sqlite3 "$DATABASE" "SELECT COUNT(*) FROM findings WHERE status='new' AND severity='high'$where_program;" 2>/dev/null || echo 0)
+    local medium=$(sqlite3 "$DATABASE" "SELECT COUNT(*) FROM findings WHERE status='new' AND severity='medium'$where_program;" 2>/dev/null || echo 0)
     local total=$((critical + high + medium))
     
     case "$format" in
@@ -651,14 +864,14 @@ generate_report() {
     <h2>Findings</h2>
     <table>
         <tr><th>Program</th><th>Target</th><th>Vulnerability</th><th>Severity</th><th>Date</th></tr>
-        $(sqlite3 "$DATABASE" "SELECT program_handle, target, vulnerability, severity, reported_at FROM findings WHERE status='new' AND program_handle='$program' ORDER BY severity DESC, reported_at DESC LIMIT 100;" 2>/dev/null | sed 's/|/<\/td><td>/g' | sed 's/^/<tr><td>/' | sed 's/$/<\/td><\/tr>/')
+        $(sqlite3 "$DATABASE" "SELECT program_handle, target, vulnerability, severity, reported_at FROM findings WHERE status='new'$where_program ORDER BY severity DESC, reported_at DESC LIMIT 100;" 2>/dev/null | sed 's/|/<\/td><td>/g' | sed 's/^/<tr><td>/' | sed 's/$/<\/td><\/tr>/')
     </table>
 </body>
 </html>
 EOF
             ;;
         json)
-            sqlite3 "$DATABASE" "SELECT json_object('program', program_handle, 'target', target, 'vulnerability', vulnerability, 'severity', severity, 'date', reported_at, 'evidence', evidence) FROM findings WHERE status='new' AND program_handle='$program' ORDER BY severity DESC;" 2>/dev/null > "$output_file"
+            sqlite3 "$DATABASE" "SELECT json_object('program', program_handle, 'target', target, 'vulnerability', vulnerability, 'severity', severity, 'date', reported_at, 'evidence', evidence) FROM findings WHERE status='new'$where_program ORDER BY severity DESC;" 2>/dev/null > "$output_file"
             ;;
     esac
     
@@ -672,13 +885,16 @@ export_findings() {
     
     local output_file="$REPORTS_DIR/findings_$(date +%Y%m%d_%H%M%S).$format"
     
+    local where_program
+    where_program="$(build_program_filter_clause "$program")"
+
     case "$format" in
         csv)
             echo "Program,Target,Vulnerability,Severity,Date,Evidence" > "$output_file"
-            sqlite3 "$DATABASE" "SELECT program_handle, target, vulnerability, severity, reported_at, evidence FROM findings WHERE status='new' AND program_handle='$program';" 2>/dev/null | sed 's/|/,/g' >> "$output_file"
+            sqlite3 "$DATABASE" "SELECT program_handle, target, vulnerability, severity, reported_at, evidence FROM findings WHERE status='new'$where_program;" 2>/dev/null | sed 's/|/,/g' >> "$output_file"
             ;;
         json)
-            sqlite3 "$DATABASE" "SELECT json_group_array(json_object('program', program_handle, 'target', target, 'vulnerability', vulnerability, 'severity', severity, 'date', reported_at, 'evidence', evidence)) FROM findings WHERE status='new' AND program_handle='$program';" 2>/dev/null > "$output_file"
+            sqlite3 "$DATABASE" "SELECT json_group_array(json_object('program', program_handle, 'target', target, 'vulnerability', vulnerability, 'severity', severity, 'date', reported_at, 'evidence', evidence)) FROM findings WHERE status='new'$where_program;" 2>/dev/null > "$output_file"
             ;;
     esac
     
@@ -689,7 +905,7 @@ clear_findings() {
     local program="${1:-}"
     
     if [ -n "$program" ]; then
-        sqlite3 "$DATABASE" "DELETE FROM findings WHERE program_handle='$program' AND status='new';" 2>/dev/null
+        sqlite3 "$DATABASE" "DELETE FROM findings WHERE program_handle='$(sql_escape "$program")' AND status='new';" 2>/dev/null
         success "Cleared findings for $program"
     else
         sqlite3 "$DATABASE" "DELETE FROM findings WHERE status='new';" 2>/dev/null
@@ -745,6 +961,7 @@ show_help() {
     echo "  clear [program]     Clear findings"
     echo "  status              Show status"
     echo "  continuous          Run continuous scanning"
+    echo "  test                Run internal smoke tests"
     echo "  help                Show this help"
     echo ""
     echo "OPTIONS:"
@@ -764,18 +981,65 @@ main() {
     load_db
     
     local command="${1:-help}"
-    local arg1="${2:-}"
-    local arg2="${3:-}"
+    shift || true
+
+    local mode_override=""
+    local interval_override=""
+    local positional=()
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --mode)
+                shift || true
+                if [ "$#" -eq 0 ]; then
+                    error "--mode requires a value"
+                    exit 1
+                fi
+                mode_override="$1"
+                ;;
+            --interval)
+                shift || true
+                if [ "$#" -eq 0 ]; then
+                    error "--interval requires a value"
+                    exit 1
+                fi
+                interval_override="$1"
+                ;;
+            *)
+                positional+=("$1")
+                ;;
+        esac
+        shift || true
+    done
+
+    local arg1="${positional[0]:-}"
+    local arg2="${positional[1]:-}"
+    local arg3="${positional[2]:-}"
+
+    if [ -n "$mode_override" ]; then
+        MODE="$mode_override"
+    fi
+
+    if [ -n "$interval_override" ]; then
+        if is_positive_int "$interval_override"; then
+            SCAN_INTERVAL="$interval_override"
+        else
+            error "--interval must be a positive integer"
+            exit 1
+        fi
+    fi
+
+    MODE="$(resolve_scan_type "$MODE")"
     
     case "$command" in
         sync)
             sync_all_programs
             ;;
         scan)
-            scan_single_program "$arg1" "${arg2:-full}"
+            scan_single_program "$arg1" "${arg2:-$MODE}"
             ;;
         scan-target)
-            scan_single_target "$arg1" "$arg2" "${3:-full}"
+            scan_single_target "$arg1" "$arg2" "${arg3:-$MODE}"
             ;;
         list)
             list_programs
@@ -800,6 +1064,9 @@ main() {
             ;;
         continuous)
             run_continuous_scan
+            ;;
+        test)
+            run_smoke_tests
             ;;
         help|--help|-h)
             show_help

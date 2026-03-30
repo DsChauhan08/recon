@@ -99,6 +99,8 @@ EOF
 }
 
 load_config() {
+    init_config
+
     if command -v yq &>/dev/null; then
         eval "$(yq eval -o=shell "$CONFIG_FILE" 2>/dev/null || echo 'true')"
     fi
@@ -108,7 +110,7 @@ load_config() {
     mkdir -p "$OUTPUT_DIR" "$NUCLEI_TEMPLATES" 2>/dev/null
 }
 
-VULN_TOOLS=(
+declare -A VULN_TOOLS=(
     ["nuclei"]="go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
     ["nuclei-templates"]="nuclei -update-templates 2>/dev/null || git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates $NUCLEI_TEMPLATES"
     ["naabu"]="go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"
@@ -327,7 +329,7 @@ VULN_TOOLS=(
     ["safebrowsing"]="pip3 install google-cloud-safebrowsing 2>/dev/null || true"
 )
 
-VULN_CATEGORIES=(
+declare -A VULN_CATEGORIES=(
     ["nuclei"]="scanner"
     ["nuclei-templates"]="templates"
     ["naabu"]="port"

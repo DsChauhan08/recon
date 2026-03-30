@@ -67,6 +67,8 @@ EOF
 }
 
 load_config() {
+    init_config
+
     if command -v yq &>/dev/null; then
         eval "$(yq eval -o=shell "$CONFIG_FILE" 2>/dev/null || echo 'true')"
     fi
@@ -75,7 +77,7 @@ load_config() {
     mkdir -p "$OUTPUT_DIR"
 }
 
-TOOLS=(
+declare -A TOOLS=(
     ["subfinder"]="go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
     ["assetfinder"]="go install -v github.com/tomnomnom/assetfinder@latest"
     ["sublist3r"]="pip3 install sublist3r 2>/dev/null || git clone https://github.com/aboul3la/Sublist3r && cd Sublist3r && pip3 install -r requirements.txt"
@@ -286,7 +288,7 @@ TOOLS=(
     ["google"]="curl -s \"https://www.google.com/\" | head -1 || true"
 )
 
-TOOL_CATEGORIES=(
+declare -A TOOL_CATEGORIES=(
     ["subfinder"]="subdomain"
     ["assetfinder"]="subdomain"
     ["sublist3r"]="subdomain"
