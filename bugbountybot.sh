@@ -130,6 +130,168 @@ build_program_filter_clause() {
     fi
 }
 
+json_escape() {
+    local value="${1:-}"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf "%s" "$value"
+}
+
+hash_string() {
+    local input="${1:-}"
+
+    if command -v sha256sum &>/dev/null; then
+        printf "%s" "$input" | sha256sum | cut -d' ' -f1
+    elif command -v shasum &>/dev/null; then
+        printf "%s" "$input" | shasum -a 256 | cut -d' ' -f1
+    else
+        printf "%s" "$input" | cksum | cut -d' ' -f1
+    fi
+}
+
+declare -a RECON_PLUGIN_ORDER=()
+declare -a VULN_PLUGIN_ORDER=()
+declare -A PLUGIN_RUNNER=()
+declare -A PLUGIN_COMMAND=()
+declare -A PLUGIN_ENABLED_KEY=()
+declare -A PLUGIN_CATEGORY=()
+declare -A PLUGIN_CONFIDENCE=()
+declare -A PLUGIN_RESULT_PARSER=()
+
+register_plugin() {
+    local phase="$1"
+    local name="$2"
+    local runner="$3"
+    local command_name="$4"
+    local enabled_key="${5:-}"
+    local category="${6:-misc}"
+    local confidence="${7:-medium}"
+    local parser="${8:-}"
+
+    if [ -z "$phase" ] || [ -z "$name" ] || [ -z "$runner" ] || [ -z "$command_name" ]; then
+        warn "Invalid plugin definition: phase/name/runner/command required"
+        return 1
+    fi
+
+    if [ "$phase" = "recon" ]; then
+        RECON_PLUGIN_ORDER+=("$name")
+    elif [ "$phase" = "vuln" ]; then
+        VULN_PLUGIN_ORDER+=("$name")
+    else
+        warn "Unknown plugin phase while registering '$name': $phase"
+        return 1
+    fi
+
+    PLUGIN_RUNNER["$name"]="$runner"
+    PLUGIN_COMMAND["$name"]="$command_name"
+    PLUGIN_ENABLED_KEY["$name"]="$enabled_key"
+    PLUGIN_CATEGORY["$name"]="$category"
+    PLUGIN_CONFIDENCE["$name"]="$confidence"
+    PLUGIN_RESULT_PARSER["$name"]="$parser"
+}
+
+load_plugins() {
+    RECON_PLUGIN_ORDER=()
+    VULN_PLUGIN_ORDER=()
+    PLUGIN_RUNNER=()
+    PLUGIN_COMMAND=()
+    PLUGIN_ENABLED_KEY=()
+    PLUGIN_CATEGORY=()
+    PLUGIN_CONFIDENCE=()
+    PLUGIN_RESULT_PARSER=()
+
+    local plugin_file
+
+    for plugin_file in "$SCRIPT_DIR/plugins/recon/"*.sh; do
+        [ -f "$plugin_file" ] || continue
+        # shellcheck source=/dev/null
+        source "$plugin_file"
+    done
+
+    for plugin_file in "$SCRIPT_DIR/plugins/vuln/"*.sh; do
+        [ -f "$plugin_file" ] || continue
+        # shellcheck source=/dev/null
+        source "$plugin_file"
+    done
+
+    if [ "${#RECON_PLUGIN_ORDER[@]}" -eq 0 ] && [ "${#VULN_PLUGIN_ORDER[@]}" -eq 0 ]; then
+        warn "No plugins loaded from $SCRIPT_DIR/plugins"
+    fi
+}
+
+plugin_enabled() {
+    local plugin="$1"
+    local key="${PLUGIN_ENABLED_KEY[$plugin]:-}"
+
+    if [ -z "$key" ]; then
+        return 0
+    fi
+
+    local value="${!key:-true}"
+    [ "$value" = "true" ]
+}
+
+plugin_available() {
+    local plugin="$1"
+    local command_name="${PLUGIN_COMMAND[$plugin]:-}"
+    [ -n "$command_name" ] && command -v "$command_name" &>/dev/null
+}
+
+run_plugins() {
+    local phase="$1"
+    local target="$2"
+    local output_dir="$3"
+    local -a plugin_list=()
+
+    case "$phase" in
+        recon)
+            plugin_list=("${RECON_PLUGIN_ORDER[@]}")
+            ;;
+        vuln)
+            plugin_list=("${VULN_PLUGIN_ORDER[@]}")
+            ;;
+        *)
+            warn "Unknown plugin phase: $phase"
+            return 1
+            ;;
+    esac
+
+    local plugin
+    for plugin in "${plugin_list[@]}"; do
+        if ! plugin_enabled "$plugin"; then
+            continue
+        fi
+
+        if ! plugin_available "$plugin"; then
+            continue
+        fi
+
+        local runner="${PLUGIN_RUNNER[$plugin]:-}"
+        if [ -n "$runner" ] && declare -F "$runner" >/dev/null; then
+            "$runner" "$target" "$output_dir" &
+        fi
+    done
+
+    wait
+}
+
+parse_plugin_results() {
+    local program="$1"
+    local target="$2"
+    local output_dir="$3"
+
+    local plugin parser
+    for plugin in "${VULN_PLUGIN_ORDER[@]}"; do
+        parser="${PLUGIN_RESULT_PARSER[$plugin]:-}"
+        if [ -n "$parser" ] && declare -F "$parser" >/dev/null; then
+            "$parser" "$program" "$target" "$output_dir"
+        fi
+    done
+}
+
 load_config() {
     init_config
 
@@ -196,10 +358,57 @@ CREATE TABLE findings (
     FOREIGN KEY (program_handle) REFERENCES programs(handle)
 );
 
+CREATE TABLE normalized_findings (
+    id INTEGER PRIMARY KEY,
+    finding_hash TEXT UNIQUE,
+    program_handle TEXT,
+    target TEXT,
+    plugin TEXT,
+    title TEXT,
+    category TEXT,
+    severity TEXT,
+    confidence TEXT,
+    status TEXT,
+    raw_file TEXT,
+    raw_line INTEGER,
+    raw_payload TEXT,
+    normalized_json TEXT,
+    asset TEXT,
+    vector TEXT,
+    correlation_key TEXT,
+    seen_delta_seconds INTEGER DEFAULT 0,
+    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE finding_correlations (
+    id INTEGER PRIMARY KEY,
+    correlation_key TEXT,
+    finding_hash TEXT,
+    program_handle TEXT,
+    target TEXT,
+    asset TEXT,
+    plugin TEXT,
+    vector TEXT,
+    severity TEXT,
+    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(correlation_key, finding_hash)
+);
+
 CREATE INDEX idx_targets_program ON targets(program_handle);
 CREATE INDEX idx_targets_value ON targets(value);
 CREATE INDEX idx_findings_program ON findings(program_handle);
 CREATE INDEX idx_findings_severity ON findings(severity);
+CREATE INDEX idx_nf_program ON normalized_findings(program_handle);
+CREATE INDEX idx_nf_target ON normalized_findings(target);
+CREATE INDEX idx_nf_plugin ON normalized_findings(plugin);
+CREATE INDEX idx_nf_severity ON normalized_findings(severity);
+CREATE INDEX idx_nf_asset ON normalized_findings(asset);
+CREATE INDEX idx_nf_vector ON normalized_findings(vector);
+CREATE INDEX idx_nf_corr ON normalized_findings(correlation_key);
+CREATE INDEX idx_fc_corr ON finding_correlations(correlation_key);
+CREATE INDEX idx_fc_hash ON finding_correlations(finding_hash);
 EOF
         success "Initialized database: $DATABASE"
     fi
@@ -207,6 +416,58 @@ EOF
     if ! sqlite3 "$DATABASE" "PRAGMA table_info(programs);" 2>/dev/null | grep -q '|updated_at|'; then
         sqlite3 "$DATABASE" "ALTER TABLE programs ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;" 2>/dev/null || true
     fi
+
+    sqlite3 "$DATABASE" << 'EOF' 2>/dev/null
+CREATE TABLE IF NOT EXISTS normalized_findings (
+    id INTEGER PRIMARY KEY,
+    finding_hash TEXT UNIQUE,
+    program_handle TEXT,
+    target TEXT,
+    plugin TEXT,
+    title TEXT,
+    category TEXT,
+    severity TEXT,
+    confidence TEXT,
+    status TEXT,
+    raw_file TEXT,
+    raw_line INTEGER,
+    raw_payload TEXT,
+    normalized_json TEXT,
+    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS finding_correlations (
+    id INTEGER PRIMARY KEY,
+    correlation_key TEXT,
+    finding_hash TEXT,
+    program_handle TEXT,
+    target TEXT,
+    asset TEXT,
+    plugin TEXT,
+    vector TEXT,
+    severity TEXT,
+    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(correlation_key, finding_hash)
+);
+EOF
+
+    sqlite3 "$DATABASE" "ALTER TABLE normalized_findings ADD COLUMN asset TEXT;" 2>/dev/null || true
+    sqlite3 "$DATABASE" "ALTER TABLE normalized_findings ADD COLUMN vector TEXT;" 2>/dev/null || true
+    sqlite3 "$DATABASE" "ALTER TABLE normalized_findings ADD COLUMN correlation_key TEXT;" 2>/dev/null || true
+    sqlite3 "$DATABASE" "ALTER TABLE normalized_findings ADD COLUMN seen_delta_seconds INTEGER DEFAULT 0;" 2>/dev/null || true
+
+    sqlite3 "$DATABASE" "CREATE INDEX IF NOT EXISTS idx_nf_program ON normalized_findings(program_handle);" 2>/dev/null || true
+    sqlite3 "$DATABASE" "CREATE INDEX IF NOT EXISTS idx_nf_target ON normalized_findings(target);" 2>/dev/null || true
+    sqlite3 "$DATABASE" "CREATE INDEX IF NOT EXISTS idx_nf_plugin ON normalized_findings(plugin);" 2>/dev/null || true
+    sqlite3 "$DATABASE" "CREATE INDEX IF NOT EXISTS idx_nf_severity ON normalized_findings(severity);" 2>/dev/null || true
+    sqlite3 "$DATABASE" "CREATE INDEX IF NOT EXISTS idx_nf_asset ON normalized_findings(asset);" 2>/dev/null || true
+    sqlite3 "$DATABASE" "CREATE INDEX IF NOT EXISTS idx_nf_vector ON normalized_findings(vector);" 2>/dev/null || true
+    sqlite3 "$DATABASE" "CREATE INDEX IF NOT EXISTS idx_nf_corr ON normalized_findings(correlation_key);" 2>/dev/null || true
+    sqlite3 "$DATABASE" "CREATE INDEX IF NOT EXISTS idx_fc_corr ON finding_correlations(correlation_key);" 2>/dev/null || true
+    sqlite3 "$DATABASE" "CREATE INDEX IF NOT EXISTS idx_fc_hash ON finding_correlations(finding_hash);" 2>/dev/null || true
+    sqlite3 "$DATABASE" "CREATE UNIQUE INDEX IF NOT EXISTS idx_fc_unique ON finding_correlations(correlation_key, finding_hash);" 2>/dev/null || true
 }
 
 run_smoke_tests() {
@@ -226,13 +487,17 @@ run_smoke_tests() {
 
     local original_database="$DATABASE"
     local original_reports_dir="$REPORTS_DIR"
+    local original_script_dir="$SCRIPT_DIR"
     DATABASE="$test_db"
     REPORTS_DIR="$test_reports_dir"
+    SCRIPT_DIR="/home/regulus/Programs/Recon"
 
     if ! load_db >/dev/null 2>&1; then
         error "Smoke test failed: unable to initialize database"
         failures=$((failures + 1))
     fi
+
+    load_plugins >/dev/null 2>&1 || true
 
     if ! add_program "acme'corp" "ACME's Program" "https://example.com" "\$100-\$500" >/dev/null 2>&1; then
         error "Smoke test failed: add_program with quotes"
@@ -270,8 +535,46 @@ run_smoke_tests() {
         failures=$((failures + 1))
     fi
 
+    local normalized_table_exists
+    normalized_table_exists=$(sqlite3 "$DATABASE" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='normalized_findings';" 2>/dev/null || echo 0)
+    if [ "$normalized_table_exists" != "1" ]; then
+        error "Smoke test failed: normalized_findings table missing"
+        failures=$((failures + 1))
+    fi
+
+    local correlation_table_exists
+    correlation_table_exists=$(sqlite3 "$DATABASE" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='finding_correlations';" 2>/dev/null || echo 0)
+    if [ "$correlation_table_exists" != "1" ]; then
+        error "Smoke test failed: finding_correlations table missing"
+        failures=$((failures + 1))
+    fi
+
+    local normalized_count
+    normalized_count=$(sqlite3 "$DATABASE" "SELECT COUNT(*) FROM normalized_findings;" 2>/dev/null || echo 0)
+    if ! [[ "$normalized_count" =~ ^[0-9]+$ ]]; then
+        normalized_count=0
+    fi
+
+    if [ "$normalized_count" -lt 1 ]; then
+        add_normalized_finding "acme'corp" "api.example.com" "nuclei" "phase2-smoke" "web" "high" "high" "smoke" 1 "payload"
+        normalized_count=$(sqlite3 "$DATABASE" "SELECT COUNT(*) FROM normalized_findings;" 2>/dev/null || echo 0)
+    fi
+
+    if ! [[ "$normalized_count" =~ ^[0-9]+$ ]] || [ "$normalized_count" -lt 1 ]; then
+        error "Smoke test failed: normalized findings insert"
+        failures=$((failures + 1))
+    fi
+
+    local correlation_count
+    correlation_count=$(sqlite3 "$DATABASE" "SELECT COUNT(*) FROM finding_correlations;" 2>/dev/null || echo 0)
+    if ! [[ "$correlation_count" =~ ^[0-9]+$ ]] || [ "$correlation_count" -lt 1 ]; then
+        error "Smoke test failed: correlation insert"
+        failures=$((failures + 1))
+    fi
+
     DATABASE="$original_database"
     REPORTS_DIR="$original_reports_dir"
+    SCRIPT_DIR="$original_script_dir"
     rm -rf "$test_dir"
 
     if [ "$failures" -gt 0 ]; then
@@ -307,6 +610,36 @@ run_unit_tests() {
 
     clause="$(build_program_filter_clause "acme")"
     [ "$clause" = " AND program_handle='acme'" ] || failures=$((failures + 1))
+
+    local plugin_runner
+    plugin_runner="${PLUGIN_RUNNER[nuclei]:-}"
+    [ -n "$plugin_runner" ] || failures=$((failures + 1))
+    if [ -n "$plugin_runner" ]; then
+        declare -F "$plugin_runner" >/dev/null || failures=$((failures + 1))
+    fi
+
+    local parser
+    parser="${PLUGIN_RESULT_PARSER[nuclei]:-}"
+    [ -n "$parser" ] || failures=$((failures + 1))
+    if [ -n "$parser" ]; then
+        declare -F "$parser" >/dev/null || failures=$((failures + 1))
+    fi
+
+    local testssl_parser
+    testssl_parser="${PLUGIN_RESULT_PARSER[testssl]:-}"
+    [ "$testssl_parser" = "parse_testssl_results" ] || failures=$((failures + 1))
+
+    local trufflehog_parser
+    trufflehog_parser="${PLUGIN_RESULT_PARSER[trufflehog]:-}"
+    [ "$trufflehog_parser" = "parse_trufflehog_results" ] || failures=$((failures + 1))
+
+    local corr_hash
+    corr_hash="$(hash_string "program|asset|vector")"
+    [ -n "$corr_hash" ] || failures=$((failures + 1))
+
+    local escaped_json
+    escaped_json="$(json_escape $'a\n"b' )"
+    [ "$escaped_json" = 'a\n\"b' ] || failures=$((failures + 1))
 
     if [ "$failures" -gt 0 ]; then
         error "Unit tests failed: $failures"
@@ -511,6 +844,240 @@ EOF
     echo "$id"
 }
 
+add_normalized_finding() {
+    local program="$1"
+    local target="$2"
+    local plugin="$3"
+    local title="$4"
+    local category="$5"
+    local severity="$6"
+    local confidence="$7"
+    local raw_file="$8"
+    local raw_line="$9"
+    shift 9
+    local raw_payload="${1:-}"
+    local vector_hint="${2:-}"
+
+    local fingerprint_source
+    fingerprint_source="$program|$target|$plugin|$title|$category|$severity|$raw_payload"
+    local finding_hash
+    finding_hash="$(hash_string "$fingerprint_source")"
+
+    local asset vector
+    asset="$(extract_asset_from_target "$target")"
+    if [ -n "$vector_hint" ]; then
+        vector="$(normalize_vector "$vector_hint")"
+    else
+        vector="$(normalize_vector "$category")"
+    fi
+
+    local correlation_key_source
+    correlation_key_source="$program|$asset|$vector"
+    local correlation_key
+    correlation_key="$(hash_string "$correlation_key_source")"
+
+    local normalized_json
+    normalized_json=$(printf '{"program":"%s","target":"%s","plugin":"%s","title":"%s","category":"%s","severity":"%s","confidence":"%s","asset":"%s","vector":"%s","correlation_key":"%s"}' \
+        "$(json_escape "$program")" \
+        "$(json_escape "$target")" \
+        "$(json_escape "$plugin")" \
+        "$(json_escape "$title")" \
+        "$(json_escape "$category")" \
+        "$(json_escape "$severity")" \
+        "$(json_escape "$confidence")" \
+        "$(json_escape "$asset")" \
+        "$(json_escape "$vector")" \
+        "$(json_escape "$correlation_key")")
+
+    local safe_hash safe_program safe_target safe_plugin safe_title safe_category
+    local safe_severity safe_confidence safe_raw_file safe_raw_payload safe_json safe_asset safe_vector safe_correlation
+    local safe_line
+    safe_hash="$(sql_escape "$finding_hash")"
+    safe_program="$(sql_escape "$program")"
+    safe_target="$(sql_escape "$target")"
+    safe_plugin="$(sql_escape "$plugin")"
+    safe_title="$(sql_escape "$title")"
+    safe_category="$(sql_escape "$category")"
+    safe_severity="$(sql_escape "$severity")"
+    safe_confidence="$(sql_escape "$confidence")"
+    safe_raw_file="$(sql_escape "$raw_file")"
+    safe_raw_payload="$(sql_escape "$raw_payload")"
+    safe_json="$(sql_escape "$normalized_json")"
+    safe_asset="$(sql_escape "$asset")"
+    safe_vector="$(sql_escape "$vector")"
+    safe_correlation="$(sql_escape "$correlation_key")"
+
+    safe_line="$raw_line"
+    if ! [[ "$safe_line" =~ ^[0-9]+$ ]]; then
+        safe_line=0
+    fi
+
+    sqlite3 "$DATABASE" << EOF
+INSERT INTO normalized_findings (
+    finding_hash,
+    program_handle,
+    target,
+    plugin,
+    title,
+    category,
+    severity,
+    confidence,
+    status,
+    raw_file,
+    raw_line,
+    raw_payload,
+    normalized_json,
+    asset,
+    vector,
+    correlation_key,
+    seen_delta_seconds,
+    first_seen,
+    last_seen
+) VALUES (
+    '$safe_hash',
+    '$safe_program',
+    '$safe_target',
+    '$safe_plugin',
+    '$safe_title',
+    '$safe_category',
+    '$safe_severity',
+    '$safe_confidence',
+    'new',
+    '$safe_raw_file',
+    $safe_line,
+    '$safe_raw_payload',
+    '$safe_json',
+    '$safe_asset',
+    '$safe_vector',
+    '$safe_correlation',
+    0,
+    datetime('now'),
+    datetime('now')
+)
+ON CONFLICT(finding_hash) DO UPDATE SET
+    last_seen=datetime('now'),
+    raw_payload=excluded.raw_payload,
+    normalized_json=excluded.normalized_json,
+    asset=excluded.asset,
+    vector=excluded.vector,
+    correlation_key=excluded.correlation_key,
+    severity=excluded.severity,
+    confidence=excluded.confidence;
+EOF
+
+    record_finding_correlation "$finding_hash" "$program" "$target" "$plugin" "$vector" "$severity"
+    update_correlation_summary "$finding_hash"
+}
+
+extract_asset_from_target() {
+    local target="${1:-}"
+    target="${target#http://}"
+    target="${target#https://}"
+    target="${target%%/*}"
+    target="${target%%:*}"
+    printf "%s" "$target"
+}
+
+normalize_vector() {
+    local value="${1:-}"
+    value="$(printf "%s" "$value" | tr '[:upper:]' '[:lower:]')"
+    value="${value// /-}"
+    printf "%s" "$value"
+}
+
+record_finding_correlation() {
+    local finding_hash="$1"
+    local program="$2"
+    local target="$3"
+    local plugin="$4"
+    local vector="$5"
+    local severity="$6"
+
+    local asset
+    asset="$(extract_asset_from_target "$target")"
+    local normalized_vector
+    normalized_vector="$(normalize_vector "$vector")"
+
+    local key_source
+    key_source="$program|$asset|$normalized_vector"
+    local correlation_key
+    correlation_key="$(hash_string "$key_source")"
+
+    local safe_corr safe_hash safe_program safe_target safe_asset safe_plugin safe_vector safe_severity
+    safe_corr="$(sql_escape "$correlation_key")"
+    safe_hash="$(sql_escape "$finding_hash")"
+    safe_program="$(sql_escape "$program")"
+    safe_target="$(sql_escape "$target")"
+    safe_asset="$(sql_escape "$asset")"
+    safe_plugin="$(sql_escape "$plugin")"
+    safe_vector="$(sql_escape "$normalized_vector")"
+    safe_severity="$(sql_escape "$severity")"
+
+    sqlite3 "$DATABASE" << EOF
+INSERT INTO finding_correlations (
+    correlation_key,
+    finding_hash,
+    program_handle,
+    target,
+    asset,
+    plugin,
+    vector,
+    severity,
+    first_seen,
+    last_seen
+) VALUES (
+    '$safe_corr',
+    '$safe_hash',
+    '$safe_program',
+    '$safe_target',
+    '$safe_asset',
+    '$safe_plugin',
+    '$safe_vector',
+    '$safe_severity',
+    datetime('now'),
+    datetime('now')
+)
+ON CONFLICT(correlation_key, finding_hash) DO UPDATE SET
+    last_seen=datetime('now'),
+    severity=excluded.severity;
+EOF
+}
+
+update_correlation_summary() {
+    local finding_hash="$1"
+
+    local safe_hash
+    safe_hash="$(sql_escape "$finding_hash")"
+
+    local correlation_key
+    correlation_key=$(sqlite3 "$DATABASE" "SELECT correlation_key FROM normalized_findings WHERE finding_hash='$safe_hash' LIMIT 1;" 2>/dev/null || echo "")
+    if [ -z "$correlation_key" ] || [ "$correlation_key" = "null" ]; then
+        return 0
+    fi
+
+    local safe_corr
+    safe_corr="$(sql_escape "$correlation_key")"
+
+    local first_seen
+    first_seen=$(sqlite3 "$DATABASE" "SELECT MIN(first_seen) FROM finding_correlations WHERE correlation_key='$safe_corr';" 2>/dev/null || echo "")
+    local last_seen
+    last_seen=$(sqlite3 "$DATABASE" "SELECT MAX(last_seen) FROM finding_correlations WHERE correlation_key='$safe_corr';" 2>/dev/null || echo "")
+
+    local delta_seconds=0
+    if [ -n "$first_seen" ] && [ -n "$last_seen" ] && [ "$first_seen" != "null" ] && [ "$last_seen" != "null" ]; then
+        delta_seconds=$(sqlite3 "$DATABASE" "SELECT CAST(strftime('%s','$last_seen') - strftime('%s','$first_seen') AS INTEGER);" 2>/dev/null || echo 0)
+        if ! [[ "$delta_seconds" =~ ^-?[0-9]+$ ]]; then
+            delta_seconds=0
+        fi
+    fi
+
+    if ! [[ "$delta_seconds" =~ ^[0-9]+$ ]]; then
+        delta_seconds=0
+    fi
+
+    sqlite3 "$DATABASE" "UPDATE normalized_findings SET first_seen=COALESCE('$first_seen', first_seen), last_seen=COALESCE('$last_seen', last_seen), seen_delta_seconds=$delta_seconds WHERE correlation_key='$safe_corr';" 2>/dev/null
+}
+
 get_resolved_count() {
     local program="$1"
     local safe_program
@@ -548,27 +1115,7 @@ recon_target() {
     local target_dir="$output_dir/$(echo "$target" | tr '/.' '_')"
     mkdir -p "$target_dir"
     
-    if [ "${recon_subdomain_enumeration:-true}" = "true" ] && command -v subfinder &>/dev/null; then
-        info "Enumerating subdomains for $target..."
-        subfinder -d "$target" -silent -o "$target_dir/subs.txt" 2>/dev/null &
-    fi
-    
-    if [ "${recon_web_technology_fingerprinting:-true}" = "true" ] && command -v whatweb &>/dev/null; then
-        info "Fingerprinting $target..."
-        whatweb -a 3 "$target" --log-brief="$target_dir/tech.txt" 2>/dev/null &
-    fi
-    
-    if [ "${recon_wayback_history:-true}" = "true" ] && command -v waybackurls &>/dev/null; then
-        info "Fetching wayback history for $target..."
-        echo "$target" | waybackurls > "$target_dir/wayback.txt" 2>/dev/null &
-    fi
-    
-    if [ "${recon_dns_enumeration:-true}" = "true" ] && command -v dnsrecon &>/dev/null; then
-        info "Running DNS enumeration on $target..."
-        dnsrecon -d "$target" -j "$target_dir/dns.json" 2>/dev/null &
-    fi
-    
-    wait
+    run_plugins "recon" "$target" "$target_dir"
 }
 
 vuln_scan_target() {
@@ -581,25 +1128,7 @@ vuln_scan_target() {
     local target_dir="$output_dir/$(echo "$target" | tr '/.' '_')"
     mkdir -p "$target_dir"
     
-    if [ "${vuln_nuclei_scan:-true}" = "true" ] && command -v nuclei &>/dev/null; then
-        info "Running nuclei on $target..."
-        nuclei -u "$target" \
-            -severity "${vuln_nuclei_severity:-critical,high,medium}" \
-            -silent \
-            -o "$target_dir/nuclei.txt" 2>/dev/null &
-    fi
-    
-    if [ "${vuln_tls_scanning:-true}" = "true" ] && command -v testssl &>/dev/null; then
-        info "Running TLS scan on $target..."
-        testssl --jsonfile="$target_dir/tls.json" "$target" 2>/dev/null &
-    fi
-    
-    if [ "${vuln_secret_detection:-true}" = "true" ] && command -v trufflehog &>/dev/null; then
-        info "Running secret detection on $target..."
-        trufflehog url "$target" --output="$target_dir/secrets.txt" 2>/dev/null &
-    fi
-    
-    wait
+    run_plugins "vuln" "$target" "$target_dir"
 }
 
 process_target() {
@@ -648,25 +1177,123 @@ parse_results() {
     local program="$1"
     local target="$2"
     local output_dir="$3"
-    
+
+    parse_plugin_results "$program" "$target" "$output_dir"
+}
+
+parse_nuclei_results() {
+    local program="$1"
+    local target="$2"
+    local output_dir="$3"
+
     local nuclei_file="$output_dir/$(echo "$target" | tr '/.' '_')/nuclei.txt"
+    [ -f "$nuclei_file" ] || return 0
 
-    if [ -f "$nuclei_file" ]; then
-        while IFS= read -r line; do
-            [ -n "$line" ] || continue
+    local line_no=0
+    while IFS= read -r line; do
+        line_no=$((line_no + 1))
+        [ -n "$line" ] || continue
 
-            local severity
-            severity=$(echo "$line" | grep -oE '\[(critical|high|medium|low|info)\]' | head -1 | tr -d '[]' || true)
+        local severity
+        severity=$(echo "$line" | grep -oE '\[(critical|high|medium|low|info)\]' | head -1 | tr -d '[]' || true)
+        [ -n "$severity" ] || severity="info"
 
-            local vuln_name
-            vuln_name=$(echo "$line" | sed -n 's/^\[[^]]*\]\[[^]]*\]\s*\([^ ]*\).*/\1/p')
-            [ -n "$vuln_name" ] || vuln_name="nuclei-finding"
+        local vuln_name
+        vuln_name=$(echo "$line" | sed -n 's/^\[[^]]*\]\[[^]]*\]\s*\([^ ]*\).*/\1/p')
+        [ -n "$vuln_name" ] || vuln_name="nuclei-finding"
 
-            if [ -n "$severity" ]; then
-                add_finding "$program" "$target" "$vuln_name" "$severity" "$line" >/dev/null
-            fi
-        done < "$nuclei_file"
-    fi
+        local category confidence vector_hint
+        category="${PLUGIN_CATEGORY[nuclei]:-web}"
+        confidence="${PLUGIN_CONFIDENCE[nuclei]:-high}"
+        vector_hint="${line%%]*]}"
+        vector_hint="${vector_hint#[}"
+        [ -n "$vector_hint" ] || vector_hint="$vuln_name"
+
+        add_finding "$program" "$target" "$vuln_name" "$severity" "$line" >/dev/null
+        add_normalized_finding "$program" "$target" "nuclei" "$vuln_name" "$category" "$severity" "$confidence" "$nuclei_file" "$line_no" "$line" "$vector_hint"
+    done < "$nuclei_file"
+}
+
+parse_testssl_results() {
+    local program="$1"
+    local target="$2"
+    local output_dir="$3"
+
+    local tls_file="$output_dir/$(echo "$target" | tr '/.' '_')/tls.json"
+    [ -f "$tls_file" ] || return 0
+
+    local line_no=0
+    while IFS= read -r line; do
+        line_no=$((line_no + 1))
+        [ -n "$line" ] || continue
+
+        local severity="medium"
+        local title="tls-misconfiguration"
+        local vector_hint="tls"
+
+        if echo "$line" | grep -qiE 'critical|high|vulnerable|weak|insecure|failed'; then
+            severity="high"
+            title="tls-critical-issue"
+        elif echo "$line" | grep -qiE 'medium|warning|deprecated'; then
+            severity="medium"
+            title="tls-warning"
+        elif echo "$line" | grep -qiE 'info|ok|pass'; then
+            severity="info"
+            title="tls-info"
+        fi
+
+        if echo "$line" | grep -qi 'heartbleed'; then
+            title="tls-heartbleed"
+            vector_hint="heartbleed"
+        elif echo "$line" | grep -qi 'renegotiation'; then
+            title="tls-renegotiation"
+            vector_hint="renegotiation"
+        elif echo "$line" | grep -qi 'cipher'; then
+            title="tls-weak-cipher"
+            vector_hint="cipher"
+        fi
+
+        add_normalized_finding "$program" "$target" "testssl" "$title" "${PLUGIN_CATEGORY[testssl]:-tls}" "$severity" "${PLUGIN_CONFIDENCE[testssl]:-medium}" "$tls_file" "$line_no" "$line" "$vector_hint"
+    done < "$tls_file"
+}
+
+parse_trufflehog_results() {
+    local program="$1"
+    local target="$2"
+    local output_dir="$3"
+
+    local secrets_file="$output_dir/$(echo "$target" | tr '/.' '_')/secrets.txt"
+    [ -f "$secrets_file" ] || return 0
+
+    local line_no=0
+    while IFS= read -r line; do
+        line_no=$((line_no + 1))
+        [ -n "$line" ] || continue
+
+        local title="secret-detected"
+        local vector_hint="generic-secret"
+        local severity="high"
+
+        if echo "$line" | grep -qi 'aws'; then
+            title="aws-secret"
+            vector_hint="aws-key"
+            severity="critical"
+        elif echo "$line" | grep -qi 'github'; then
+            title="github-token"
+            vector_hint="github-token"
+            severity="high"
+        elif echo "$line" | grep -qi 'slack'; then
+            title="slack-token"
+            vector_hint="slack-token"
+            severity="high"
+        elif echo "$line" | grep -qi 'password'; then
+            title="password-leak"
+            vector_hint="password"
+            severity="high"
+        fi
+
+        add_normalized_finding "$program" "$target" "trufflehog" "$title" "${PLUGIN_CATEGORY[trufflehog]:-secrets}" "$severity" "${PLUGIN_CONFIDENCE[trufflehog]:-medium}" "$secrets_file" "$line_no" "$line" "$vector_hint"
+    done < "$secrets_file"
 }
 
 scan_program() {
@@ -840,6 +1467,31 @@ list_findings() {
     sqlite3 -header -column "$DATABASE" "$query" 2>/dev/null
 }
 
+list_normalized_findings() {
+    local program="${1:-}"
+    local severity="${2:-}"
+
+    echo -e "${CYAN}"
+    echo "╔═══════════════════════════════════════════════╗"
+    echo "║      NORMALIZED FINDINGS                      ║"
+    echo "╚═══════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    echo ""
+
+    local query="SELECT program_handle, asset, vector, target, plugin, title, category, severity, confidence, seen_delta_seconds, first_seen, last_seen FROM normalized_findings WHERE status='new'"
+
+    if [ -n "$program" ]; then
+        query="$query AND program_handle='$(sql_escape "$program")'"
+    fi
+
+    if [ -n "$severity" ]; then
+        query="$query AND severity='$(sql_escape "$severity")'"
+    fi
+
+    query="$query ORDER BY severity DESC, last_seen DESC LIMIT 100;"
+    sqlite3 -header -column "$DATABASE" "$query" 2>/dev/null
+}
+
 generate_report() {
     local program="${1:-all}"
     local format="${2:-html}"
@@ -1000,6 +1652,7 @@ show_help() {
     echo "  list                List all programs"
     echo "  targets [program]   List targets"
     echo "  findings [prog]     List findings"
+    echo "  normalized [prog]   List normalized findings"
     echo "  report [prog] [fmt] Generate report (html/json)"
     echo "  export [prog] [fmt] Export findings (csv/json)"
     echo "  clear [program]     Clear findings"
@@ -1024,6 +1677,7 @@ show_help() {
 main() {
     load_config
     load_db
+    load_plugins
     
     local command="${1:-help}"
     shift || true
@@ -1103,6 +1757,9 @@ main() {
             ;;
         findings)
             list_findings "$arg1" "$arg2"
+            ;;
+        normalized)
+            list_normalized_findings "$arg1" "$arg2"
             ;;
         report)
             generate_report "$arg1" "${arg2:-html}"
