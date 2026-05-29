@@ -1,0 +1,187 @@
+#!/bin/bash
+set -euo pipefail
+
+# Recon Platform - unified security research CLI
+# Modes: bounty, hunt, target, cve, msf, tui
+
+export RECON_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=lib/config.sh
+source "$RECON_ROOT/lib/config.sh"
+init_paths
+
+# shellcheck source=lib/common.sh
+source "$RECON_ROOT/lib/common.sh"
+# shellcheck source=lib/db.sh
+source "$RECON_ROOT/lib/db.sh"
+# shellcheck source=lib/plugins.sh
+source "$RECON_ROOT/lib/plugins.sh"
+# shellcheck source=lib/parsers.sh
+source "$RECON_ROOT/lib/parsers.sh"
+# shellcheck source=lib/correlation.sh
+source "$RECON_ROOT/lib/correlation.sh"
+# shellcheck source=lib/msf.sh
+source "$RECON_ROOT/lib/msf.sh"
+# shellcheck source=lib/tests.sh
+source "$RECON_ROOT/lib/tests.sh"
+
+# shellcheck source=lib/modes/bounty.sh
+source "$RECON_ROOT/lib/modes/bounty.sh"
+# shellcheck source=lib/modes/target.sh
+source "$RECON_ROOT/lib/modes/target.sh"
+# shellcheck source=lib/modes/cve.sh
+source "$RECON_ROOT/lib/modes/cve.sh"
+# shellcheck source=lib/modes/hunt.sh
+source "$RECON_ROOT/lib/modes/hunt.sh"
+# shellcheck source=lib/modes/msf_mode.sh
+source "$RECON_ROOT/lib/modes/msf_mode.sh"
+# shellcheck source=lib/modes/tui.sh
+source "$RECON_ROOT/lib/modes/tui.sh"
+
+show_help() {
+    echo -e "${MAGENTA}"
+    echo "╔═══════════════════════════════════════════════╗"
+    echo "║         Recon Platform v$VERSION                 ║"
+    echo "╚═══════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    echo ""
+    echo "MODES:"
+    echo "  bounty    HackerOne bug bounty automation"
+    echo "  hunt      Internet-wide active device discovery"
+    echo "  target    Single-device deep engagement"
+    echo "  cve       CVE feed monitoring and correlation"
+    echo "  msf       Metasploit wrapper"
+    echo "  tui       Legacy interactive TUIs"
+    echo ""
+    echo "EXAMPLES:"
+    echo "  recon bounty sync"
+    echo "  recon bounty scan google --mode active"
+    echo "  recon hunt start --input ranges.txt --authorized"
+    echo "  recon target 192.168.1.1 --deep --exploit"
+    echo "  recon cve sync && recon cve list --kev"
+    echo "  recon msf search vsftpd"
+    echo "  recon test"
+    echo ""
+    echo "Run 'recon <mode> help' for mode-specific commands."
+    echo ""
+}
+
+global_status() {
+    echo -e "${MAGENTA}Recon Platform Status${NC}\n"
+    echo "Version:    $VERSION"
+    echo "Config:     $CONFIG_FILE"
+    echo "Database:   $DATABASE"
+    echo "Reports:    $REPORTS_DIR"
+    echo ""
+    bounty_status 2>/dev/null || true
+    echo ""
+    hunt_status 2>/dev/null || true
+    echo ""
+    local cve_count device_count
+    cve_count=$(sqlite3 "$DATABASE" "SELECT COUNT(*) FROM cves;" 2>/dev/null || echo 0)
+    device_count=$(sqlite3 "$DATABASE" "SELECT COUNT(*) FROM devices;" 2>/dev/null || echo 0)
+    echo "CVEs tracked: $cve_count | Devices: $device_count"
+}
+
+main() {
+    load_config
+    load_db
+    load_plugins
+
+    local mode="${1:-help}"
+    shift || true
+
+    local mode_override="" interval_override="" run_tests=false
+    local bounty_args=()
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --test) run_tests=true ;;
+            --mode)
+                shift || true
+                mode_override="${1:-}"
+                ;;
+            --interval)
+                shift || true
+                interval_override="${1:-}"
+                ;;
+            *)
+                bounty_args+=("$1")
+                ;;
+        esac
+        shift || true
+    done
+
+    if [ -n "$mode_override" ]; then
+        MODE="$mode_override"
+    fi
+
+    if [ -n "$interval_override" ]; then
+        if is_positive_int "$interval_override"; then
+            SCAN_INTERVAL="$interval_override"
+        else
+            error "--interval must be a positive integer"
+            exit 1
+        fi
+    fi
+
+    MODE="$(resolve_scan_type "$MODE")"
+
+    if [ "$run_tests" = true ] || [ "$mode" = "test" ]; then
+        run_unit_tests || exit 1
+        run_smoke_tests || exit 1
+        [ "$mode" = "test" ] && exit 0
+    fi
+
+    case "$mode" in
+        bounty|bb|h1)
+            bounty_mode_main "${bounty_args[@]:-help}"
+            ;;
+        hunt)
+            hunt_mode_main "${bounty_args[@]:-help}"
+            ;;
+        target|tgt)
+            target_mode_main "${bounty_args[@]}"
+            ;;
+        cve)
+            cve_mode_main "${bounty_args[@]:-help}"
+            ;;
+        msf|metasploit)
+            msf_mode_main "${bounty_args[@]:-help}"
+            ;;
+        tui)
+            tui_mode_main "${bounty_args[@]}"
+            ;;
+        status)
+            global_status
+            ;;
+        report)
+            local report_mode="${bounty_args[0]:-bounty}"
+            case "$report_mode" in
+                bounty) generate_bounty_report "${bounty_args[1]:-all}" "${bounty_args[2]:-html}" ;;
+                hunt) hunt_export "${bounty_args[1]:-csv}" ;;
+                *)
+                    error "Unknown report mode: $report_mode (bounty|hunt)"
+                    exit 1
+                    ;;
+            esac
+            ;;
+        test)
+            run_unit_tests && run_smoke_tests
+            ;;
+        help|--help|-h)
+            show_help
+            ;;
+        sync|scan|scan-target|list|targets|findings|normalized|export|clear|continuous)
+            # Backward compatibility: bare commands route to bounty mode
+            bounty_mode_main "$mode" "${bounty_args[@]}"
+            ;;
+        *)
+            error "Unknown mode: $mode"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

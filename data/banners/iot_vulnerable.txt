@@ -1,0 +1,11 @@
+# Vulnerable IoT / firmware banner patterns
+router_admin
+default.?password
+admin.*admin
+root.*root
+D-Link
+TP-LINK
+Hikvision
+DVR
+Netgear
+MikroTik

@@ -1,2 +1,4 @@
 /recon_20260113_090954_example_com
+.recon-test/
+.recon-test*/
 *.log

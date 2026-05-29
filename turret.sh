@@ -21,6 +21,8 @@ error() { echo -e "${RED}[✗]${NC} $1"; }
 critical() { echo -e "${RED}[CRITICAL]${NC} $1"; }
 info() { echo -e "${BLUE}[i]${NC} $1"; }
 
+echo -e "${YELLOW}[!]${NC} turret.sh is deprecated. Use: recon tui vuln  (or ./recon for CLI modes)" >&2
+
 init_config() {
     mkdir -p "$(dirname "$CONFIG_FILE")" "$(dirname "$LOG_FILE")" "$(dirname "$CONFIG_FILE")/templates" "$(dirname "$CONFIG_FILE")/reports" 2>/dev/null
     

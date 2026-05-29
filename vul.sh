@@ -20,6 +20,8 @@ warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 error() { echo -e "${RED}[✗]${NC} $1"; }
 info() { echo -e "${BLUE}[i]${NC} $1"; }
 
+echo -e "${YELLOW}[!]${NC} vul.sh is deprecated. Use: recon tui recon  (or ./recon for CLI modes)" >&2
+
 init_config() {
     mkdir -p "$(dirname "$CONFIG_FILE")" "$(dirname "$LOG_FILE")" "$(dirname "$CONFIG_FILE")/templates" "$(dirname "$CONFIG_FILE")/wordlists" 2>/dev/null
     
@@ -147,7 +149,7 @@ declare -A TOOLS=(
     ["netcraft"]="curl -s \"https://www.netcraft.com/internet-data-loader/\" | head -1"
     ["whois"]="sudo dnf install -y whois 2>/dev/null || sudo apt-get install -y whois 2>/dev/null || true"
     ["theharvester"]="pip3 install theHarvester 2>/dev/null || true"
-    ["metasploit"]="curl -LO https://raw.githubusercontent.com/rapid7/metasploit-omnibus/master/config/templates/metasploit-framework-wrappers/msfconsole.erb && chmod +x msfconsole.erb && mv msfconsole.erb /usr/local/bin/msfconsole"
+    ["metasploit"]="echo 'Install Metasploit from https://docs.metasploit.com/ — then use: recon msf doctor'"
     ["maltego"]="curl -LO https://www.maltego.com/redirect/?type=linux"
     ["recon-ng"]="git clone https://github.com/lanmaster53/recon-ng && cd recon-ng && pip3 install -r requirements.txt"
     ["spiderfoot"]="git clone https://github.com/smicallef/spiderfoot && cd spiderfoot && pip3 install -r requirements.txt"
